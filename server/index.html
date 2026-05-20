@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>ピタッと吸いつくパズルゲーム</title>
+    <style>
+        body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #eef2f3; text-align: center; color: #2c3e50; margin: 0; padding: 20px; }
+        #game-container { display: inline-block; background: #ffffff; padding: 25px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.08); margin-top: 10px; }
+        .header-panel { margin-bottom: 15px; }
+        .controls { display: flex; justify-content: center; gap: 15px; align-items: center; margin-bottom: 20px; }
+        canvas { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: inset 0 2px 4px rgba(0,0,0,0.02); display: block; margin: 0 auto; }
+        button { padding: 10px 20px; font-weight: bold; cursor: pointer; border-radius: 8px; border: 1px solid #cbd5e1; background: #ffffff; color: #334155; transition: all 0.2s; }
+        button:hover { background: #f1f5f9; border-color: #94a3b8; }
+        select { padding: 10px; font-weight: bold; border-radius: 8px; border: 1px solid #cbd5e1; background: white; color: #334155; }
+        #status { font-size: 1.1em; font-weight: 600; margin: 15px 0; color: #3b82f6; height: 1.5em; }
+        .score-board { font-size: 1.2em; font-weight: bold; background: #f1f5f9; padding: 8px 16px; border-radius: 8px; color: #1e293b; }
+        .file-input-wrapper { position: relative; overflow: hidden; display: inline-block; }
+        .file-input-wrapper input[type=file] { position: absolute; left: 0; top: 0; opacity: 0; font-size: 100px; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+    <div id="game-container">
+        <div class="header-panel">
+            <h1>🧩 吸いつくパズルエンジン</h1>
+            <p style="color: #64748b; margin: 0 0 15px 0;">マウスで下の「手持ちブロック」をドラッグして、上の盤面に近づけてみてください。</p>
+        </div>
+
+        <div class="controls">
+            <select id="difficulty-select">
+                <option value="easy">Easy (最大2マス / Undo無限)</option>
+                <option value="medium" selected>Medium (標準 / Undo3回)</option>
+                <option value="hard">Hard (極悪5マス / Undo禁止)</option>
+            </select>
+            
+            <div class="file-input-wrapper">
+                <button class="btn-file">🖼️ 画像から盤面生成</button>
+                <input type="file" id="image-loader" accept="image/*">
+            </div>
+            
+            <button id="undo-btn">↩️ Undo (<span id="undo-count">3</span>)</button>
+            <div class="score-board">SCORE: <span id="score-display">0</span></div>
+        </div>
+
+        <div id="status">手持ちブロックをドラッグして盤面にハメてください</div>
+        <!-- 盤面(400px) + 余白 + 手持ちエリア(120px) = 550px -->
+        <canvas id="gameCanvas" width="400" height="550"></canvas>
+    </div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// --- 設計定数 ---
+const boardSize = 8;
+const cellSize = 50; // 400px / 8マス
+const boardHeight = boardSize * cellSize; // 400px
+const handAreaTop = 430; // 手持ちブロックの表示基準Y座標
+const snapTolerance = 35; // 【ロジスティクス】吸いつき判定閾値（ピクセル距離）
+
+// --- ゲーム状態（不変性と単一指向のステート管理） ---
+let state = {
+    grid: Array(boardSize).fill(null).map(() => Array(boardSize).fill(0)),
+    score: 0,
+    combo: 0,
+    difficulty: "medium",
+    undosLeft: 3,
+    history: [],
+    
+    // 現在の手持ちブロック情報
+    currentBlock: {
+        cells: [{x:0, y:0}, {x:1, y:0}, {x:2, y:0}, {x:2, y:1}], // デフォルトL字
+        color: '#3b82f6'
+    },
+    
+    // ドラッグ＆スナップの動的変数
+    drag: {
+        isDragging: false,
+        x: 200, // 現在のマウス/描画X
+        y: 480, // 現在のマウス/描画Y
+        offsetX: 0, // ブロック中心からの掴みオフセット
+        offsetY: 0,
+        snapX: null, // 吸いつき先のグリッドXインデックス
+        snapY: null  // 吸いつき先のグリッドYインデックス
+    }
+};
+
+// 難易度別のブロック定義プール
+const blockPools = {
+    easy: [
+        { cells: [{x:0, y:0}], color: '#10b981' },
+        { cells: [{x:0, y:0}, {x:1, y:0}], color: '#14b8a6' }
+    ],
+    medium: [
+        { cells: [{x:0, y:0}, {x:1, y:0}, {x:2, y:0}, {x:2, y:1}], color: '#3b82f6' }, // L字
+        { cells: [{x:0, y:0}, {x:1, y:0}, {x:0, y:1}, {x:1, y:1}], color: '#f59e0b' }, // 正方形
+        { cells: [{x:1, y:0}, {x:0, y:1}, {x:1, y:1}, {x:2, y:1}], color: '#8b5cf6' }  // T字
+    ],
+    hard: [
+        { cells: [{x:1, y:0}, {x:0, y:1}, {x:1, y:1}, {x:2, y:1}, {x:1, y:2}], color: '#ef4444' }, // 十字
+        { cells: [{x:0, y:0}, {x:0, y:1}, {x:1, y:1}, {x:1, y:2}], color: '#ec4899' }  // Z字
+    ]
+};
+
+// --- 難易度変更処理 ---
+document.getElementById('difficulty-select').addEventListener('change', (e) => {
+    state.difficulty = e.target.value;
+    state.undosLeft = state.difficulty === 'easy' ? 99 : (state.difficulty === 'medium' ? 3 : 0);
+    document.getElementById('undo-count').innerText = state.difficulty === 'easy' ? "∞" : state.undosLeft;
+    spawnNextBlock();
+    resetBoard();
+});
+
+function resetBoard() {
+    state.grid = Array(boardSize).fill(null).map(() => Array(boardSize).fill(0));
+    state.score = 0;
+    state.combo = 0;
+    state.history = [];
+    document.getElementById('score-display').innerText = state.score;
+    document.getElementById('status').innerText = "難易度が変更されました。ゲーム開始！";
+    draw();
+}
+
+// --- ブロック配給（ロジスティクス） ---
+function spawnNextBlock() {
+    const pool = blockPools[state.difficulty];
+    const picked = pool[Math.floor(Math.random() * pool.length)];
+    state.currentBlock = JSON.parse(JSON.stringify(picked));
+    
+    // ドラッグ状態を手持ち位置(中央下部)に戻す
+    state.drag.isDragging = false;
+    state.drag.x = 200;
+    state.drag.y = 480;
+    state.drag.snapX = null;
+    state.drag.snapY = null;
+    draw();
+}
+
+// --- Mementoパターン（状態保存・復元） ---
+function saveState() {
+    if (state.history.length >= 10) state.history.shift();
+    state.history.push({
+        grid: JSON.parse(JSON.stringify(state.grid)),
+        score: state.score,
+        combo: state.combo,
+        undosLeft: state.undosLeft
+    });
+}
+
+document.getElementById('undo-btn').addEventListener('click', () => {
+    if (state.undosLeft <= 0) {
+        updateStatus("🚫 この難易度ではこれ以上Undoできません！", "#ef4444");
+        return;
+    }
+    if (state.history.length === 0) {
+        updateStatus("⚠️ 戻せる履歴がありません。", "#f59e0b");
+        return;
+    }
+    const previous = state.history.pop();
+    state.grid = previous.grid;
+    state.score = previous.score;
+    state.combo = previous.combo;
+    state.undosLeft = state.difficulty === 'easy' ? 99 : state.undosLeft - 1;
+    
+    document.getElementById('score-display').innerText = state.score;
+    document.getElementById('undo-count').innerText = state.difficulty === 'easy' ? "∞" : state.undosLeft;
+    updateStatus("↩️ 一手前の状態へ安全に引き戻しました。", "#10b981");
+    draw();
+});
+
+// --- 画像ピクセル解析 ＆ 例外防衛フォールバック ---
+document.getElementById('image-loader').addEventListener('change', function(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = function(event) {
+        const img = new Image();
+        img.onload = function() {
+            const scanCanvas = document.createElement('canvas');
+            const scanCtx = scanCanvas.getContext('2d');
+            scanCanvas.width = boardSize;
+            scanCanvas.height = boardSize;
+            scanCtx.drawImage(img, 0, 0, boardSize, boardSize);
+            
+            const imgData = scanCtx.getImageData(0, 0, boardSize, boardSize).data;
+            const backupGrid = JSON.parse(JSON.stringify(state.grid));
+            let filledCount = 0;
+
+            for (let y = 0; y < boardSize; y++) {
+                for (let x = 0; x < boardSize; x++) {
+                    const idx = (y * boardSize + x) * 4;
+                    const luminance = 0.299*imgData[idx] + 0.587*imgData[idx+1] + 0.114*imgData[idx+2];
+                    if (luminance < 128) {
+                        state.grid[y][x] = 1;
+                        filledCount++;
+                    } else {
+                        state.grid[y][x] = 0;
+                    }
+                }
+            }
+
+            // 完全な白/黒画像に対する防御境界チェック
+            if (filledCount === 0 || filledCount === boardSize * boardSize) {
+                updateStatus("❌ 画像解析例外: コントラスト不足のため盤面を復元します。", "#ef4444");
+                state.grid = backupGrid;
+            } else {
+                updateStatus("✨ 画像から新規アライメント盤面を生成しました！", "#10b981");
+                saveState();
+            }
+            draw();
+        };
+        img.src = event.target.result;
+    };
+    reader.readAsDataURL(file);
+});
+
+// --- 【核心】ドラッグ・吸いつき（スナップ）計算ロジック ---
+
+function getMousePos(e) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top
+    };
+}
+
+// 駒が盤面に配置可能かどうかの幾何交差チェック
+function checkValidPlacement(gridX, gridY) {
+    return state.currentBlock.cells.every(cell => {
+        const tx = gridX + cell.x;
+        const ty = gridY + cell.y;
+        return tx >= 0 && tx < boardSize && ty >= 0 && ty < boardSize && state.grid[ty][tx] === 0;
+    });
+}
+
+canvas.addEventListener('mousedown', (e) => {
+    const pos = getMousePos(e);
+    
+    // 手持ちエリアのブロックがクリックされたか判定
+    // ブロックのバウンディングボックスの簡易重心から計算
+    const blockCenterX = state.drag.x;
+    const blockCenterY = state.drag.y;
+    
+    // クリック位置が手持ちブロックの描画領域に近い場合ドラッグ開始
+    const dist = Math.hypot(pos.x - blockCenterX, pos.y - blockCenterY);
+    if (dist < 60) {
+        state.drag.isDragging = true;
+        state.drag.offsetX = pos.x - state.drag.x;
+        state.drag.offsetY = pos.y - state.drag.y;
+        updateStatus("🧲 グリッドに近づけるとピタッと吸いつきます", "#3b82f6");
+    }
+});
+
+canvas.addEventListener('mousemove', (e) => {
+    if (!state.drag.isDragging) return;
+    const pos = getMousePos(e);
+    
+    // マウス位置に追従させる
+    state.drag.x = pos.x - state.drag.offsetX;
+    state.drag.y = pos.y - state.drag.offsetY;
+    
+    // 【吸いつき（磁気スナップ）の空間計算】
+    // ブロックの原点(0,0)が、盤面のどのマスの中心に一番近いかを逆算
+    const estimatedGridX = Math.round((state.drag.x - cellSize/2) / cellSize);
+    const estimatedGridY = Math.round((state.drag.y - cellSize/2) / cellSize);
+    
+    // 逆算されたターゲットマスの中心座標
+    const targetPixelX = estimatedGridX * cellSize + cellSize/2;
+    const targetPixelY = estimatedGridY * cellSize + cellSize/2;
+    
+    // 現在のドラッグ位置と、吸いつき候補点の幾何距離を算出
+    const distanceToSnap = Math.hypot(state.drag.x - targetPixelX, state.drag.y - targetPixelY);
+    
+    // 条件：盤面の範囲内であり、かつ吸いつき許容距離（閾値）未満の場合
+    if (estimatedGridX >= 0 && estimatedGridX < boardSize && 
+        estimatedGridY >= 0 && estimatedGridY < boardSize && 
+        distanceToSnap < snapTolerance) {
+        
+        // 磁気吸着（座標をグリッド交点へ強制プロット）
+        state.drag.snapX = estimatedGridX;
+        state.drag.snapY = estimatedGridY;
+    } else {
+        // 閾値の外なら吸いつきを解除（自由ドラッグ）
+        state.drag.snapX = null;
+        state.drag.snapY = null;
+    }
+    
+    draw();
+});
+
+canvas.addEventListener('mouseup', () => {
+    if (!state.drag.isDragging) return;
+    state.drag.isDragging = false;
+    
+    // 吸いついた状態で指が離され、かつ配置が有効な場合のみ確定
+    if (state.drag.snapX !== null && state.drag.snapY !== null && checkValidPlacement(state.drag.snapX, state.drag.snapY)) {
+        saveState();
+        
+        state.currentBlock.cells.forEach(cell => {
+            state.grid[state.drag.snapY + cell.y][state.drag.snapX + cell.x] = 1;
+        });
+        
+        processLineClears();
+        spawnNextBlock();
+        checkGameOver();
+    } else {
+        // 配置できない、または空中で離した場合は手持ち位置へ慣性リセット
+        state.drag.x = 200;
+        state.drag.y = 480;
+        state.drag.snapX = null;
+        state.drag.snapY = null;
+        updateStatus("位置がズレているか、障害物があります", "#64748b");
+        draw();
+    }
+});
+
+// --- ライン消去 ＆ 連鎖スコアリング ---
+function processLineClears() {
+    let rowsToClear = Array(boardSize).fill(false);
+    let colsToClear = Array(boardSize).fill(false);
+    let lines = 0;
+
+    for (let y = 0; y < boardSize; y++) {
+        if (state.grid[y].every(v => v === 1)) { rowsToClear[y] = true; lines++; }
+    }
+    for (let x = 0; x < boardSize; x++) {
+        let colFull = true;
+        for (let y = 0; y < boardSize; y++) {
+            if (state.grid[y][x] === 0) { colFull = false; break; }
+        }
+        if (colFull) { colsToClear[x] = true; lines++; }
+    }
+
+    if (lines === 0) {
+        state.combo = 0;
+        return;
+    }
+
+    // ライン一括消去
+    for (let y = 0; y < boardSize; y++) {
+        for (let x = 0; x < boardSize; x++) {
+            if (rowsToClear[y] || colsToClear[x]) state.grid[y][x] = 0;
+        }
+    }
+
+    state.combo++;
+    state.score += (lines * 100) + (state.combo * 50);
+    document.getElementById('score-display').innerText = state.score;
+    updateStatus(`🎯 ${lines}ライン消去！ ${state.combo}連鎖システム作動！`, "#10b981");
+}
+
+function checkGameOver() {
+    // 盤面内のどこかに現ブロックを配置できるスロットがあるか検証
+    let hasSlot = false;
+    for (let y = 0; y < boardSize; y++) {
+        for (let x = 0; x < boardSize; x++) {
+            if (checkValidPlacement(x, y)) {
+                hasSlot = true;
+                break;
+            }
+        }
+        if (hasSlot) break;
+    }
+    
+    if (!hasSlot) {
+        updateStatus("💀 GAME OVER (配置不可能な詰み状態に達しました)", "#ef4444");
+    }
+}
+
+function updateStatus(msg, color) {
+    const el = document.getElementById('status');
+    el.innerText = msg;
+    el.style.color = color;
+}
+
+// --- 高精度レンダリングパイプライン ---
+function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    // 1. メイン盤面グリッドの描画
+    for (let y = 0; y < boardSize; y++) {
+        for (let x = 0; x < boardSize; x++) {
+            ctx.strokeStyle = '#e2e8f0';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(x * cellSize, y * cellSize, cellSize, cellSize);
+            
+            // 固定されたブロックの描画
+            if (state.grid[y][x] === 1) {
+                ctx.fillStyle = '#1e293b'; // 高級感のある濃紺
+                ctx.fillRect(x * cellSize + 2, y * cellSize + 2, cellSize - 4, cellSize - 4);
+            }
+        }
+    }
+    
+    // 2. 分離境界線の描画（盤面と手持ちエリアの境界）
+    ctx.strokeStyle = '#cbd5e1';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, boardHeight + 10);
+    ctx.lineTo(canvas.width, boardHeight + 10);
+    ctx.stroke();
+    
+    // 手持ちエリア背景
+    ctx.fillStyle = '#f8fafc';
+    ctx.fillRect(0, boardHeight + 12, canvas.width, canvas.height - boardHeight - 12);
+
+    // 3. スナッププレビュー（吸いつき時のガイド枠）の描画
+    if (state.drag.isDragging && state.drag.snapX !== null && state.drag.snapY !== null) {
+        const isValid = checkValidPlacement(state.drag.snapX, state.drag.snapY);
+        ctx.fillStyle = isValid ? 'rgba(59, 130, 246, 0.25)' : 'rgba(239, 68, 68, 0.3)'; // 置けるなら青、重なるなら赤
+        
+        state.currentBlock.cells.forEach(cell => {
+            const px = (state.drag.snapX + cell.x) * cellSize;
+            const py = (state.drag.snapY + cell.y) * cellSize;
+            ctx.fillRect(px + 1, py + 1, cellSize - 2, cellSize - 2);
+        });
+    }
+
+    // 4. 動いている手持ちブロック本体の描画
+    ctx.save();
+    if (state.drag.isDragging) {
+        // ドラッグ中は、吸いつき状態（snapX）があればそのグリッド位置へ、なければマウス位置へ
+        let drawX, drawY;
+        if (state.drag.snapX !== null && state.drag.snapY !== null) {
+            // 吸いつき中：グリッドにピタッと固定された座標
+            drawX = state.drag.snapX * cellSize + cellSize/2;
+            drawY = state.drag.snapY * cellSize + cellSize/2;
+            ctx.shadowBlur = 4;
+            ctx.shadowColor = "rgba(0,0,0,0.1)";
+        } else {
+            // 自由ドラッグ中：マウスに追従（浮き上がり効果）
+            drawX = state.drag.x;
+            drawY = state.drag.y;
+            ctx.shadowBlur = 12;
+            ctx.shadowColor = "rgba(0,0,0,0.2)";
+        }
+        
+        ctx.fillStyle = state.currentBlock.color;
+        state.currentBlock.cells.forEach(cell => {
+            // 原点中心からマスをマッピング
+            const px = drawX + (cell.x * cellSize) - (cellSize / 2);
+            const py = drawY + (cell.y * cellSize) - (cellSize / 2);
+            ctx.fillRect(px + 2, py + 2, cellSize - 4, cellSize - 4);
+        });
+    } else {
+        // 非ドラッグ時（待機状態）：手持ちエリア中央に綺麗に納める
+        ctx.fillStyle = state.currentBlock.color;
+        state.currentBlock.cells.forEach(cell => {
+            const px = state.drag.x + (cell.x * cellSize) - (cellSize / 2);
+            const py = state.drag.y + (cell.y * cellSize) - (cellSize / 2);
+            ctx.fillRect(px + 2, py + 2, cellSize - 4, cellSize - 4);
+        });
+    }
+    ctx.restore();
+}
+
+// 初期化レンダリング
+draw();
+</script>
+</body>
+</html>
